@@ -9,14 +9,14 @@ store/
 data/
 logs/
 
-# Groups - only track base structure and specific CLAUDE.md files
+# Groups - track main/ structure; global/CLAUDE.md is deployed by Pan, not tracked here
 groups/*
 !groups/main/
 !groups/global/
 groups/main/*
 groups/global/*
 !groups/main/CLAUDE.md
-!groups/global/CLAUDE.md
+!groups/global/.gitkeep
 
 # Secrets
 *.keys.json
