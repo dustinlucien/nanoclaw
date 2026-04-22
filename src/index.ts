@@ -40,6 +40,7 @@ import {
   getNewMessages,
   getRouterState,
   initDatabase,
+  insertTapeEntry,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -283,6 +284,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
+  const triggerMessageIds = missedMessages.map((m) => m.id);
+  const pendingWrites: Array<{ f: string; e: string | null; m: string | null }> = [];
+
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
@@ -291,7 +295,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           ? result.result
           : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      // Strip <!--pan:...--> tape tags — collect write metadata, never shown to user
+      let text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '');
+      text = text.replace(/<!--pan:([\s\S]*?)-->/g, (_, json) => {
+        try {
+          const data = JSON.parse(json);
+          if (Array.isArray(data.w)) {
+            for (const w of data.w) {
+              pendingWrites.push({
+                f: String(w.f ?? ''),
+                e: w.e ? String(w.e) : null,
+                m: w.m ? String(w.m) : null,
+              });
+            }
+          }
+        } catch { /* malformed tag, ignore */ }
+        return '';
+      });
+      text = text.trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
         await channel.sendMessage(chatJid, text);
@@ -312,6 +333,38 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+
+  // Flush tape entries collected via <!--pan:--> tags this turn.
+  // Reads final file state after container exits — two writes in one turn record
+  // only the final state, which is acceptable for Phase 2.
+  if (pendingWrites.length > 0) {
+    const tapeTs = new Date().toISOString();
+    const groupDir = resolveGroupFolderPath(group.folder);
+    for (const w of pendingWrites) {
+      if (!w.f) continue;
+      const filePath = path.join(groupDir, w.f);
+      let content = '';
+      try {
+        content = fs.readFileSync(filePath, 'utf-8');
+      } catch {
+        logger.warn({ file: w.f, group: group.name }, 'Tape: file not readable after agent run');
+        continue;
+      }
+      try {
+        insertTapeEntry({
+          ts: tapeTs,
+          actor: group.folder,
+          trigger_message_ids: triggerMessageIds,
+          file_path: w.f,
+          event_type: w.e,
+          pan_mode: w.m,
+          content,
+        });
+      } catch (err) {
+        logger.warn({ err, file: w.f }, 'Tape: failed to insert entry');
+      }
+    }
+  }
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —

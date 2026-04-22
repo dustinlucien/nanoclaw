@@ -82,6 +82,17 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS tape_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      trigger_message_ids TEXT,
+      file_path TEXT NOT NULL,
+      event_type TEXT,
+      pan_mode TEXT,
+      content TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_tape_entries_actor_file ON tape_entries(actor, file_path);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -687,6 +698,33 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Tape entries ---
+
+export interface TapeEntry {
+  ts: string;
+  actor: string;
+  trigger_message_ids: string[];
+  file_path: string;
+  event_type: string | null;
+  pan_mode: string | null;
+  content: string;
+}
+
+export function insertTapeEntry(entry: TapeEntry): void {
+  db.prepare(
+    `INSERT INTO tape_entries (ts, actor, trigger_message_ids, file_path, event_type, pan_mode, content)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    entry.ts,
+    entry.actor,
+    JSON.stringify(entry.trigger_message_ids),
+    entry.file_path,
+    entry.event_type,
+    entry.pan_mode,
+    entry.content,
+  );
 }
 
 // --- JSON migration ---
