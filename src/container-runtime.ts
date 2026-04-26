@@ -10,6 +10,30 @@ import { logger } from './logger.js';
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
+/** Hostname containers use to reach the host. */
+export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+
+/**
+ * Address the credential proxy binds to.
+ * Docker Desktop (macOS): 127.0.0.1 — the VM routes host.docker.internal to loopback.
+ * Docker (Linux): bind to the docker0 bridge IP so only containers can reach it.
+ */
+function detectProxyBindHost(): string {
+  if (os.platform() === 'darwin') return '127.0.0.1';
+  // On Linux, bind to the docker0 bridge so containers can reach it
+  try {
+    const result = execSync(
+      "ip -4 addr show docker0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1",
+      { encoding: 'utf8', stdio: 'pipe' },
+    ).trim();
+    if (result) return result;
+  } catch { /* fall through */ }
+  return '0.0.0.0';
+}
+
+export const PROXY_BIND_HOST =
+  process.env.CREDENTIAL_PROXY_HOST || detectProxyBindHost();
+
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
   // On Linux, host.docker.internal isn't built-in — add it explicitly
