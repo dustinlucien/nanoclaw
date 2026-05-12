@@ -95,6 +95,8 @@ export interface OutboundFile {
 
 /** Outbound message from host to adapter. */
 export interface OutboundMessage {
+  /** Host outbound message id. Present for normal delivery; omitted in tests or legacy call sites. */
+  id?: string;
   kind: string;
   content: unknown; // parsed JSON from messages_out
   files?: OutboundFile[]; // file attachments from the session outbox

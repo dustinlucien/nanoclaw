@@ -17,10 +17,13 @@
  *   SMS_PUBLIC_WEBHOOK_URL=https://example.com/sms
  *   TWILIO_VALIDATE_SIGNATURE=true|false
  *   TWILIO_MAX_BODY_LENGTH=1530
+ *   SMS_MAX_WEBHOOK_BODY_BYTES=65536
+ *   TWILIO_STATUS_CALLBACK_URL=https://example.com/sms/status
  */
 import crypto from 'crypto';
 import http from 'http';
 
+import { dbSmsStateStore, type SmsStateStore } from '../db/sms-state.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
@@ -30,6 +33,7 @@ const CHANNEL_TYPE = 'sms';
 const DEFAULT_WEBHOOK_PORT = 3001;
 const DEFAULT_WEBHOOK_PATH = '/sms';
 const DEFAULT_MAX_BODY_LENGTH = 1530;
+const DEFAULT_MAX_WEBHOOK_BODY_BYTES = 64 * 1024;
 const TWILIO_MESSAGES_API_VERSION = '2010-04-01';
 
 type FetchLike = typeof fetch;
@@ -44,7 +48,10 @@ export interface SmsConfig {
   publicWebhookUrl?: string;
   validateSignature: boolean;
   maxBodyLength: number;
+  maxWebhookBodyBytes: number;
+  statusCallbackUrl?: string;
   fetchImpl?: FetchLike;
+  stateStore?: SmsStateStore;
 }
 
 export interface TwilioInbound {
@@ -55,6 +62,15 @@ export interface TwilioInbound {
   numMedia: number;
   media: Array<{ url: string; contentType?: string }>;
   optOutType?: string;
+}
+
+class WebhookHttpError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly publicMessage: string,
+  ) {
+    super(publicMessage);
+  }
 }
 
 function envValue(env: Record<string, string>, key: string): string | undefined {
@@ -85,6 +101,8 @@ export function readSmsConfig(): SmsConfig | null {
     'SMS_PUBLIC_WEBHOOK_URL',
     'TWILIO_VALIDATE_SIGNATURE',
     'TWILIO_MAX_BODY_LENGTH',
+    'SMS_MAX_WEBHOOK_BODY_BYTES',
+    'TWILIO_STATUS_CALLBACK_URL',
   ]);
 
   const accountSid = envValue(env, 'TWILIO_ACCOUNT_SID');
@@ -107,6 +125,8 @@ export function readSmsConfig(): SmsConfig | null {
     publicWebhookUrl: envValue(env, 'SMS_PUBLIC_WEBHOOK_URL'),
     validateSignature: envBool(env, 'TWILIO_VALIDATE_SIGNATURE', true),
     maxBodyLength: envInt(env, 'TWILIO_MAX_BODY_LENGTH', DEFAULT_MAX_BODY_LENGTH),
+    maxWebhookBodyBytes: envInt(env, 'SMS_MAX_WEBHOOK_BODY_BYTES', DEFAULT_MAX_WEBHOOK_BODY_BYTES),
+    statusCallbackUrl: envValue(env, 'TWILIO_STATUS_CALLBACK_URL'),
   };
 }
 
@@ -133,6 +153,28 @@ export function parseTwilioInbound(params: URLSearchParams): TwilioInbound {
     media,
     optOutType: params.get('OptOutType') || undefined,
   };
+}
+
+export function applySmsOptOut(store: SmsStateStore, inbound: TwilioInbound): boolean {
+  if (!inbound.optOutType) return false;
+
+  const optOutType = inbound.optOutType.trim().toUpperCase();
+  switch (optOutType) {
+    case 'STOP':
+      store.recordOptOut(inbound.from, optOutType);
+      log.info('SMS recipient opted out', { from: inbound.from, optOutType });
+      return true;
+    case 'START':
+      store.clearOptOut(inbound.from);
+      log.info('SMS recipient opted back in', { from: inbound.from, optOutType });
+      return true;
+    case 'HELP':
+      log.info('SMS help keyword handled by Twilio', { from: inbound.from, optOutType });
+      return true;
+    default:
+      log.info('SMS opt-out keyword handled by Twilio', { from: inbound.from, optOutType });
+      return true;
+  }
 }
 
 export function twilioInboundToMessage(inbound: TwilioInbound): InboundMessage {
@@ -263,6 +305,9 @@ export async function sendTwilioSms(config: SmsConfig, to: string, body: string)
   } else if (config.fromNumber) {
     params.set('From', config.fromNumber);
   }
+  if (config.statusCallbackUrl) {
+    params.set('StatusCallback', config.statusCallbackUrl);
+  }
 
   const auth = Buffer.from(`${config.accountSid}:${config.authToken}`).toString('base64');
   const url = `https://api.twilio.com/${TWILIO_MESSAGES_API_VERSION}/Accounts/${encodeURIComponent(
@@ -298,7 +343,7 @@ export function createSmsAdapter(config: SmsConfig): ChannelAdapter {
     async setup(hostConfig: ChannelSetup): Promise<void> {
       setupConfig = hostConfig;
       server = http.createServer((req, res) => {
-        void handleWebhook(req, res, config, hostConfig);
+        void handleWebhook(req, res, config, hostConfig).catch((err) => respondWebhookError(res, err));
       });
       await new Promise<void>((resolve, reject) => {
         server!.once('error', reject);
@@ -326,9 +371,25 @@ export function createSmsAdapter(config: SmsConfig): ChannelAdapter {
       const text = extractSmsText(message);
       if (!text) return undefined;
 
+      const store = config.stateStore ?? dbSmsStateStore;
+      if (store.isOptedOut(platformId)) {
+        log.warn('SMS delivery suppressed because recipient opted out', { platformId });
+        throw new Error(`SMS recipient opted out: ${platformId}`);
+      }
+
       let firstId: string | undefined;
-      for (const chunk of splitSmsText(text, config.maxBodyLength)) {
+      const chunks = splitSmsText(text, config.maxBodyLength);
+      const deliveryKey = smsDeliveryKey(platformId, message, text, chunks.length);
+      for (let idx = 0; idx < chunks.length; idx++) {
+        const existingSid = store.getSentChunk(deliveryKey, idx);
+        if (existingSid) {
+          firstId ??= existingSid;
+          continue;
+        }
+        const chunk = chunks[idx]!;
         const sid = await sendTwilioSms(config, platformId, chunk);
+        if (!sid) throw new Error('Twilio SMS send succeeded without a message SID');
+        store.recordSentChunk(deliveryKey, idx, sid);
         firstId ??= sid;
       }
       return firstId;
@@ -345,16 +406,20 @@ async function handleWebhook(
   hostConfig: ChannelSetup,
 ): Promise<void> {
   const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  if (req.method === 'POST' && requestUrl.pathname === statusCallbackPath(config)) {
+    await handleStatusCallback(req, res, config, requestUrl);
+    return;
+  }
   if (req.method !== 'POST' || requestUrl.pathname !== config.webhookPath) {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not found');
     return;
   }
 
-  const body = await readBody(req);
+  const body = await readBody(req, config.maxWebhookBodyBytes);
   const params = new URLSearchParams(body);
   if (config.validateSignature) {
-    const publicUrl = config.publicWebhookUrl || requestPublicUrl(req, requestUrl.pathname);
+    const publicUrl = config.publicWebhookUrl || requestPublicUrl(req, `${requestUrl.pathname}${requestUrl.search}`);
     const signature = headerString(req.headers['x-twilio-signature']);
     if (!validateTwilioSignature(config.authToken, publicUrl, params, signature)) {
       log.warn('Rejected SMS webhook with invalid Twilio signature', { publicUrl });
@@ -370,6 +435,11 @@ async function handleWebhook(
     res.end('Missing From');
     return;
   }
+  if (applySmsOptOut(config.stateStore ?? dbSmsStateStore, inbound)) {
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    res.end('<Response></Response>');
+    return;
+  }
 
   try {
     await hostConfig.onInbound(inbound.from, null, twilioInboundToMessage(inbound));
@@ -382,24 +452,123 @@ async function handleWebhook(
   }
 }
 
-function readBody(req: http.IncomingMessage): Promise<string> {
+async function handleStatusCallback(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  config: SmsConfig,
+  requestUrl: URL,
+): Promise<void> {
+  const body = await readBody(req, config.maxWebhookBodyBytes);
+  const params = new URLSearchParams(body);
+  if (config.validateSignature) {
+    const publicUrl = config.statusCallbackUrl || requestPublicUrl(req, `${requestUrl.pathname}${requestUrl.search}`);
+    const signature = headerString(req.headers['x-twilio-signature']);
+    if (!validateTwilioSignature(config.authToken, publicUrl, params, signature)) {
+      log.warn('Rejected SMS status callback with invalid Twilio signature', { publicUrl });
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('Forbidden');
+      return;
+    }
+  }
+
+  const sid = params.get('MessageSid') || params.get('SmsSid') || '';
+  const status = params.get('MessageStatus') || params.get('SmsStatus') || '';
+  const errorCode = params.get('ErrorCode') || undefined;
+  const errorMessage = params.get('ErrorMessage') || undefined;
+  const payload = {
+    sid,
+    status,
+    to: params.get('To') || undefined,
+    from: params.get('From') || undefined,
+    errorCode,
+    errorMessage,
+  };
+  if (errorCode) {
+    log.warn('Twilio SMS delivery status callback reported failure', payload);
+  } else {
+    log.info('Twilio SMS delivery status callback received', payload);
+  }
+
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('OK');
+}
+
+function readBody(req: http.IncomingMessage, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
+    let total = 0;
+    let settled = false;
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
+    req.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      total += chunk.length;
+      if (total > maxBytes) {
+        fail(new WebhookHttpError(413, 'Payload too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    req.on('error', (err) => fail(err));
   });
 }
 
-function requestPublicUrl(req: http.IncomingMessage, path: string): string {
+function requestPublicUrl(req: http.IncomingMessage, pathAndSearch: string): string {
   const proto = headerString(req.headers['x-forwarded-proto'])?.split(',')[0]?.trim() || 'http';
   const host = headerString(req.headers['x-forwarded-host'])?.split(',')[0]?.trim() || req.headers.host || 'localhost';
-  return `${proto}://${host}${path}`;
+  return `${proto}://${host}${pathAndSearch}`;
 }
 
 function headerString(value: string | string[] | undefined): string | undefined {
   if (Array.isArray(value)) return value[0];
   return value;
+}
+
+function statusCallbackPath(config: SmsConfig): string {
+  if (config.statusCallbackUrl && URL.canParse(config.statusCallbackUrl)) {
+    return new URL(config.statusCallbackUrl).pathname;
+  }
+  return config.webhookPath.endsWith('/') ? `${config.webhookPath}status` : `${config.webhookPath}/status`;
+}
+
+function smsDeliveryKey(platformId: string, message: OutboundMessage, text: string, chunkCount: number): string {
+  const stableId = message.id ?? '';
+  return crypto
+    .createHash('sha256')
+    .update(platformId)
+    .update('\0')
+    .update(stableId)
+    .update('\0')
+    .update(text)
+    .update('\0')
+    .update(String(chunkCount))
+    .digest('hex');
+}
+
+function respondWebhookError(res: http.ServerResponse, err: unknown): void {
+  const statusCode = err instanceof WebhookHttpError ? err.statusCode : 500;
+  const publicMessage = err instanceof WebhookHttpError ? err.publicMessage : 'Internal Server Error';
+  if (statusCode >= 500) {
+    log.error('SMS webhook failed', { err });
+  } else {
+    log.warn('SMS webhook rejected', { statusCode, err });
+  }
+  if (!res.headersSent) {
+    res.writeHead(statusCode, { 'Content-Type': 'text/plain' });
+  }
+  if (!res.writableEnded) {
+    res.end(publicMessage);
+  }
 }
 
 registerChannelAdapter(CHANNEL_TYPE, {

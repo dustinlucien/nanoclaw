@@ -2,7 +2,9 @@ import crypto from 'crypto';
 
 import { describe, expect, it } from 'vitest';
 
+import { createMemorySmsStateStore } from '../db/sms-state.js';
 import {
+  applySmsOptOut,
   createSmsAdapter,
   extractSmsText,
   parseTwilioInbound,
@@ -22,6 +24,8 @@ function baseConfig(overrides: Partial<SmsConfig> = {}): SmsConfig {
     webhookPath: '/sms',
     validateSignature: true,
     maxBodyLength: 1530,
+    maxWebhookBodyBytes: 65536,
+    stateStore: createMemorySmsStateStore(),
     ...overrides,
   };
 }
@@ -116,6 +120,25 @@ describe('sms channel helpers', () => {
     expect(validateTwilioSignature('secret', url, params, signature)).toBe(true);
     expect(validateTwilioSignature('wrong', url, params, signature)).toBe(false);
   });
+
+  it('applies Twilio opt-out side effects and suppresses keyword routing', () => {
+    const store = createMemorySmsStateStore();
+    const inbound = parseTwilioInbound(
+      new URLSearchParams({
+        MessageSid: 'SM123',
+        From: '+15551234567',
+        To: '+15557654321',
+        Body: 'STOP',
+        OptOutType: 'STOP',
+      }),
+    );
+
+    expect(applySmsOptOut(store, inbound)).toBe(true);
+    expect(store.isOptedOut('+15551234567')).toBe(true);
+
+    expect(applySmsOptOut(store, { ...inbound, body: 'START', optOutType: 'START' })).toBe(true);
+    expect(store.isOptedOut('+15551234567')).toBe(false);
+  });
 });
 
 describe('sms channel delivery', () => {
@@ -159,6 +182,27 @@ describe('sms channel delivery', () => {
     expect(calls[0].body).toBe('To=%2B15551234567&Body=hello&MessagingServiceSid=MG123');
   });
 
+  it('includes Twilio status callback URL when configured', async () => {
+    const calls: Array<{ body: string }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      calls.push({ body: String(init?.body) });
+      return new Response(JSON.stringify({ sid: 'SMout' }), { status: 201 });
+    };
+
+    await sendTwilioSms(
+      baseConfig({
+        fetchImpl,
+        statusCallbackUrl: 'https://example.com/sms/status',
+      }),
+      '+15551234567',
+      'hello',
+    );
+
+    expect(calls[0].body).toBe(
+      'To=%2B15551234567&Body=hello&From=%2B15550001111&StatusCallback=https%3A%2F%2Fexample.com%2Fsms%2Fstatus',
+    );
+  });
+
   it('adapter deliver splits long messages and returns the first Twilio id', async () => {
     const bodies: string[] = [];
     const fetchImpl: typeof fetch = async (_url, init) => {
@@ -169,10 +213,57 @@ describe('sms channel delivery', () => {
 
     const sid = await adapter.deliver('+15551234567', null, {
       kind: 'chat',
+      id: 'msg-1',
       content: { text: 'hello world' },
     });
 
     expect(sid).toBe('SM1');
     expect(bodies).toEqual(['hello', 'world']);
+  });
+
+  it('does not resend already-sent chunks when a split SMS retry resumes', async () => {
+    const bodies: string[] = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      bodies.push(new URLSearchParams(String(init?.body)).get('Body') || '');
+      if (bodies.length === 2) {
+        return new Response('temporary failure', { status: 503 });
+      }
+      return new Response(JSON.stringify({ sid: `SM${bodies.length}` }), { status: 201 });
+    };
+    const adapter = createSmsAdapter(baseConfig({ fetchImpl, maxBodyLength: 5 }));
+
+    await expect(
+      adapter.deliver('+15551234567', null, {
+        id: 'msg-1',
+        kind: 'chat',
+        content: { text: 'hello world' },
+      }),
+    ).rejects.toThrow('Twilio SMS send failed');
+
+    const sid = await adapter.deliver('+15551234567', null, {
+      id: 'msg-1',
+      kind: 'chat',
+      content: { text: 'hello world' },
+    });
+
+    expect(sid).toBe('SM1');
+    expect(bodies).toEqual(['hello', 'world', 'world']);
+  });
+
+  it('suppresses outbound delivery when the recipient opted out', async () => {
+    const store = createMemorySmsStateStore();
+    store.recordOptOut('+15551234567', 'STOP');
+    const fetchImpl: typeof fetch = async () => {
+      throw new Error('fetch should not be called');
+    };
+    const adapter = createSmsAdapter(baseConfig({ fetchImpl, stateStore: store }));
+
+    await expect(
+      adapter.deliver('+15551234567', null, {
+        id: 'msg-1',
+        kind: 'chat',
+        content: { text: 'hello' },
+      }),
+    ).rejects.toThrow('SMS recipient opted out');
   });
 });

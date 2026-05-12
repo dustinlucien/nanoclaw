@@ -144,6 +144,25 @@ CREATE TABLE pending_sender_approvals (
   created_at         TEXT NOT NULL,
   UNIQUE(messaging_group_id, sender_identity)
 );
+
+-- SMS-specific safety state. sms_opt_outs prevents outbound sends after
+-- Twilio reports an opt-out keyword. sms_message_chunks makes outbound
+-- multi-message delivery retry-safe: if chunk N succeeds and chunk N+1
+-- fails, a retry skips the already-sent chunks instead of duplicating them.
+CREATE TABLE sms_opt_outs (
+  phone_number TEXT PRIMARY KEY,
+  opt_out_type TEXT NOT NULL,
+  opted_out_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE sms_message_chunks (
+  delivery_key TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  twilio_sid TEXT NOT NULL,
+  sent_at TEXT NOT NULL,
+  PRIMARY KEY (delivery_key, chunk_index)
+);
 `;
 
 /**
