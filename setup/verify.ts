@@ -160,6 +160,10 @@ export async function run(_args: string[]): Promise<void> {
     'RESEND_API_KEY',
     'WHATSAPP_ACCESS_TOKEN',
     'IMESSAGE_ENABLED',
+    'TWILIO_ACCOUNT_SID',
+    'TWILIO_AUTH_TOKEN',
+    'TWILIO_FROM_NUMBER',
+    'TWILIO_MESSAGING_SERVICE_SID',
   ]);
 
   const has = (key: string) => !!(process.env[key] || envVars[key]);
@@ -184,6 +188,13 @@ export async function run(_args: string[]): Promise<void> {
   if (has('RESEND_API_KEY')) channelAuth.resend = 'configured';
   if (has('WHATSAPP_ACCESS_TOKEN')) channelAuth['whatsapp-cloud'] = 'configured';
   if (has('IMESSAGE_ENABLED')) channelAuth.imessage = 'configured';
+  if (
+    has('TWILIO_ACCOUNT_SID') &&
+    has('TWILIO_AUTH_TOKEN') &&
+    (has('TWILIO_FROM_NUMBER') || has('TWILIO_MESSAGING_SERVICE_SID'))
+  ) {
+    channelAuth.sms = 'configured';
+  }
 
   const configuredChannels = Object.keys(channelAuth);
 
